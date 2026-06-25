@@ -248,14 +248,32 @@ Rules:
 
    - Items sold at a single price have "variants": [] (do not invent sizes).
 
+   FORM / PREPARATION variants (IMPORTANT — applies to sushi, dumplings, etc.):
+   When the SAME item is offered in two FORMS that differ only in preparation or
+   presentation — most commonly **Sushi vs Sashimi**, or **Fried vs Steamed** — that
+   is ONE item with VARIANTS, NOT two separate items.
+   - If the two forms have different prices (e.g. a "Sushi (2pcs)" price and a
+     "Sashimi (2pcs)" price for the same fish), emit ONE item named for the fish
+     ("Tuna (Maguro)") and list each form as a variant:
+       "variants": [
+         {"name": "Sushi (2pcs)",   "name_translation": null, "price": 3.99},
+         {"name": "Sashimi (2pcs)", "name_translation": null, "price": 4.49}
+       ]
+   - If the two forms share one price (e.g. "Gyoza (fried/steamed)" at one price),
+     keep a SINGLE item and note both forms in its name.
+   - NEVER output "Tuna Sushi" and "Tuna Sashimi" (or "Fried Gyoza" and "Steamed
+     Gyoza") as two separate items. Collapse the form into ONE item every time.
+
 7. SPLIT "EITHER/OR" ITEMS: When one menu line offers interchangeable
    alternatives joined by "or", output a SEPARATE item for EACH alternative,
    distributing the shared words (which may come before or after the "or"):
      "Egg Roll or Spring Roll"        -> "Egg Roll" + "Spring Roll"
-     "Fried or Steamed Dumpling"      -> "Fried Dumpling" + "Steamed Dumpling"
      "Roast Pork or Chicken Lo Mein"  -> "Roast Pork Lo Mein" + "Chicken Lo Mein"
      "Sweet & Sour Chicken or Pork"   -> "Sweet & Sour Chicken" + "Sweet & Sour Pork"
      "Roast Pork or Chicken or Vegetable Fried Rice" -> three separate items
+   Apply this ONLY to genuinely DIFFERENT dishes / proteins / ingredients. Do NOT
+   apply it to mere FORM or PREPARATION of the same item (Sushi vs Sashimi, Fried
+   vs Steamed) — those are variants of ONE item per rule 6, never separate items.
    Each split item is its own item and keeps the SAME price, item_type, sec, and
    variants as the original line, plus the same leading menu number/letter if any
    (e.g. "L6. Sweet & Sour Chicken" and "L6. Sweet & Sour Pork"). Split the
@@ -406,8 +424,11 @@ def _claude_text(response) -> str:
                    if getattr(b, "type", None) == "text")
 
 
+GEMINI_MAX_TOKENS = 32768   # room for gemini-2.5-pro's internal reasoning plus the JSON output
+
+
 def extract_with_gemini(image_paths: list, model: str) -> dict:
-    """Send one or more page images (in order) as a single menu to Gemini."""
+    """Send one or more page images (in order) as a single menu to Gemini (JSON mode)."""
     try:
         from google import genai
         from google.genai import types
@@ -425,34 +446,55 @@ def extract_with_gemini(image_paths: list, model: str) -> dict:
             parts.append(types.Part.from_text(text=f"--- Page {i} ---"))
         parts.append(types.Part.from_bytes(data=raw, mime_type=media_type))
     parts.append(types.Part.from_text(text=build_prompt(len(image_paths))))
-    user_turn = types.Content(role="user", parts=parts)
-    config = types.GenerateContentConfig(max_output_tokens=MAX_TOKENS, temperature=0)
 
-    accumulated = ""
-    for round_no in range(12):
-        if not accumulated:
-            contents = [user_turn]
-        else:
-            contents = [
-                user_turn,
-                types.Content(role="model", parts=[types.Part.from_text(text=accumulated)]),
-                types.Content(role="user", parts=[types.Part.from_text(text=CONTINUE_INSTRUCTION)]),
-            ]
-        response = client.models.generate_content(model=model, contents=contents, config=config)
-        um = getattr(response, "usage_metadata", None)
-        if um is not None:
-            USAGE["input_tokens"] += getattr(um, "prompt_token_count", 0) or 0
-            USAGE["output_tokens"] += ((getattr(um, "candidates_token_count", 0) or 0)
-                                       + (getattr(um, "thoughts_token_count", 0) or 0))
-        chunk = _gemini_text(response)
-        accumulated = _stitch_text(accumulated, chunk).rstrip()
-        if not _gemini_truncated(response):
-            break
-        if round_no >= 1:
-            print(f"  (page is long — continuing extraction, part {round_no + 2})")
-    else:
-        sys.exit("Page was too long to finish even after many continuation rounds.")
-    return parse_json(accumulated)
+    config = types.GenerateContentConfig(
+        max_output_tokens=GEMINI_MAX_TOKENS,
+        temperature=0,
+        response_mime_type="application/json",     # force clean JSON, no markdown fences
+    )
+    response = client.models.generate_content(
+        model=model, contents=[types.Content(role="user", parts=parts)], config=config,
+    )
+
+    um = getattr(response, "usage_metadata", None)
+    if um is not None:
+        USAGE["input_tokens"] += getattr(um, "prompt_token_count", 0) or 0
+        USAGE["output_tokens"] += ((getattr(um, "candidates_token_count", 0) or 0)
+                                   + (getattr(um, "thoughts_token_count", 0) or 0))
+
+    text = _gemini_text(response)
+    if not text.strip():
+        if _gemini_truncated(response):
+            raise RuntimeError(
+                "Gemini produced no JSON because it ran out of output budget "
+                f"{_gemini_diagnose(response)}. The menu/page is large for one call — "
+                "try a higher GEMINI_MAX_TOKENS, fewer items per image, or the Claude provider.")
+        raise RuntimeError(
+            "Gemini returned no text " + _gemini_diagnose(response) +
+            ". The image may have been blocked or unreadable — try a clearer image, "
+            "or use the Claude provider.")
+    if _gemini_truncated(response):
+        raise RuntimeError(
+            "Gemini hit its output-token limit before finishing the JSON for this page. "
+            "Raise GEMINI_MAX_TOKENS, split the menu into fewer items per image, "
+            "or use the Claude provider.")
+    return parse_json(text)
+
+
+def _gemini_diagnose(response) -> str:
+    """Short human-readable reason a Gemini response had no usable text."""
+    bits = []
+    cands = getattr(response, "candidates", None) or []
+    if cands:
+        fr = getattr(cands[0], "finish_reason", None)
+        if fr is not None:
+            bits.append(f"finish_reason={fr}")
+    pf = getattr(response, "prompt_feedback", None)
+    if pf is not None:
+        br = getattr(pf, "block_reason", None)
+        if br:
+            bits.append(f"block_reason={br}")
+    return "(" + ", ".join(str(b) for b in bits) + ")" if bits else "(no extra detail)"
 
 
 def _gemini_text(response) -> str:
