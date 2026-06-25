@@ -115,8 +115,13 @@ def parse_usage_line(stdout: str) -> dict:
     return {}
 
 
-def run_engine_on_image(python_exe: str, engine_path: str, image: str, out_xlsx: str) -> dict:
-    cmd = [python_exe, engine_path, "--image", image, "--output", out_xlsx]
+def run_engine_on_image(python_exe: str, engine_path: str, image: str, out_xlsx: str,
+                        provider: str = None, model: str = None) -> dict:
+    cmd = [python_exe, engine_path, "--image", image, "--output", out_xlsx, "--no-section-sec"]
+    if provider:
+        cmd += ["--provider", provider]
+    if model:
+        cmd += ["--model", model]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0 or not os.path.isfile(out_xlsx):
         sys.exit(f"Engine failed on {os.path.basename(image)}:\n"
@@ -228,6 +233,7 @@ def stitch(page_paths: list, columns: list, continuation_pages: set):
     sec_offset = 0
     variant_id = 0
     modifier_id = 0
+    group_ordinal = 0
     menu_fields = (None, None, None)
     menu_captured = False
 
@@ -242,14 +248,8 @@ def stitch(page_paths: list, columns: list, continuation_pages: set):
                            page_rows[0].get("Menu Group 3"))
             menu_captured = True
 
-        page_max_sec = 0
-        for r in page_rows:
-            for i in parse_sec(r.get("Sec")):
-                page_max_sec = max(page_max_sec, i)
-
         local_to_global = {}          # this page's Item ID -> global Item ID
-        cat_local_to_global = {}      # this page's Category ID -> global Category ID
-        current_global_cat = category_id
+        page_combo_max = 0
         first_section_in_page = True
         for r in page_rows:
             new = {c: None for c in columns}
@@ -258,7 +258,6 @@ def stitch(page_paths: list, columns: list, continuation_pages: set):
             new["Item 3"] = r.get("Item 3")
             new["Item Type"] = r.get("Item Type")
             new["Price"] = r.get("Price")
-            new["Sec"] = format_sec([i + sec_offset for i in parse_sec(r.get("Sec"))])
 
             if r.get("Category ID") is not None:           # a section start on this page
                 folds_into_previous = (first_section_in_page
@@ -270,9 +269,14 @@ def stitch(page_paths: list, columns: list, continuation_pages: set):
                     new["Category"] = r.get("Category")
                     new["Category 2"] = r.get("Category 2")
                     new["Category 3"] = r.get("Category 3")
-                current_global_cat = category_id
-                cat_local_to_global[r.get("Category ID")] = current_global_cat
                 first_section_in_page = False
+
+            # Sec carries combo ids only at this stage (offset so pages don't
+            # collide). Section/modifier sec ids are added later by finalize_sec.
+            combo_ids = parse_sec(r.get("Sec"))
+            if combo_ids:
+                page_combo_max = max(page_combo_max, max(combo_ids))
+            new["Sec"] = format_sec([i + sec_offset for i in combo_ids])
 
             item_id += 1
             new["Item ID"] = item_id
@@ -300,14 +304,19 @@ def stitch(page_paths: list, columns: list, continuation_pages: set):
                 "price":           v.get("price"),
             })
 
-        # remap this page's section modifiers onto the global Category ids
-        for smod in read_page_modifiers(path):
-            gl_cat = cat_local_to_global.get(smod.get("Section Id"))
-            if gl_cat is None:
-                continue
+        # merge this page's section modifiers; renumber each page's group ids to
+        # globally-unique ordinals (finalize_sec shifts them past combo ids later).
+        page_mods = read_page_modifiers(path)
+        local_group_ids = sorted({m.get("Section Id") for m in page_mods
+                                  if m.get("Section Id") is not None})
+        group_remap = {}
+        for lg in local_group_ids:
+            group_ordinal += 1
+            group_remap[lg] = group_ordinal
+        for smod in page_mods:
             modifier_id += 1
             section_rows.append({
-                "Section Id":    gl_cat,
+                "Section Id":    group_remap.get(smod.get("Section Id")),
                 "SectionName":   smod.get("SectionName"),
                 "Min":           smod.get("Min"),
                 "Max":           smod.get("Max"),
@@ -317,7 +326,7 @@ def stitch(page_paths: list, columns: list, continuation_pages: set):
                 "Price":         smod.get("Price"),
             })
 
-        sec_offset += page_max_sec
+        sec_offset += page_combo_max
 
     return merged, variant_rows, section_rows
 
@@ -338,13 +347,54 @@ def continuations_by_name(page_section_lists: list) -> set:
     return cont
 
 
-def continuations_by_ai(page_section_lists: list, model: str) -> set:
+def _detect_call_claude(prompt: str, model: str):
+    import anthropic
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    response = client.messages.create(
+        model=model, max_tokens=500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    u = getattr(response, "usage", None)
+    usage_dict = {
+        "model": model,
+        "input_tokens": (getattr(u, "input_tokens", 0) or 0) if u else 0,
+        "output_tokens": (getattr(u, "output_tokens", 0) or 0) if u else 0,
+    }
+    text = "".join(b.text for b in (getattr(response, "content", None) or [])
+                   if getattr(b, "type", None) == "text")
+    return text, usage_dict
+
+
+def _detect_call_gemini(prompt: str, model: str):
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")))
+    response = client.models.generate_content(
+        model=model, contents=prompt,
+        config=types.GenerateContentConfig(
+            max_output_tokens=500, temperature=0, response_mime_type="application/json"),
+    )
+    um = getattr(response, "usage_metadata", None)
+    usage_dict = {
+        "model": model,
+        "input_tokens": (getattr(um, "prompt_token_count", 0) or 0) if um else 0,
+        "output_tokens": (((getattr(um, "candidates_token_count", 0) or 0)
+                           + (getattr(um, "thoughts_token_count", 0) or 0)) if um else 0),
+    }
+    text = getattr(response, "text", None) or ""
+    return text, usage_dict
+
+
+def continuations_by_ai(page_section_lists: list, model: str, provider: str = "claude") -> set:
     """Ask the model, in ONE small text-only call, which page boundaries are a
     single section split across the break. Returns 0-based later-page indices.
     Raises on any failure so the caller can fall back."""
-    from anthropic import Anthropic
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise RuntimeError("no API key")
+    if provider == "gemini":
+        if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+            raise RuntimeError("no API key")
+    else:
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("no API key")
 
     # Build the list of boundaries between consecutive non-empty pages.
     boundaries = []          # (later_page_index, earlier_last_section, later_first_section)
@@ -377,19 +427,10 @@ def continuations_by_ai(page_section_lists: list, model: str) -> set:
           "numbers that ARE continuations]}."
     )
 
-    client = Anthropic()
-    message = client.messages.create(
-        model=model,
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    usage = getattr(message, "usage", None)
-    usage_dict = {
-        "model": model,
-        "input_tokens": (getattr(usage, "input_tokens", 0) or 0) if usage else 0,
-        "output_tokens": (getattr(usage, "output_tokens", 0) or 0) if usage else 0,
-    }
-    text = "".join(b.text for b in message.content if b.type == "text")
+    if provider == "gemini":
+        text, usage_dict = _detect_call_gemini(prompt, model)
+    else:
+        text, usage_dict = _detect_call_claude(prompt, model)
     data = parse_json_loose(text)
     flagged = {int(x) for x in data.get("continuations", [])}
     later_indices = {boundaries[n - 1][0] for n in flagged if 1 <= n <= len(boundaries)}
@@ -421,6 +462,9 @@ def main() -> None:
     ap.add_argument("--keep-pages", action="store_true", help="Keep the per-page .xlsx files.")
     ap.add_argument("--pages-dir", help="Where to write per-page files (default: a temp folder).")
     ap.add_argument("--python", default=sys.executable, help="Python interpreter for the engine.")
+    ap.add_argument("--provider", choices=["claude", "gemini"],
+                    help="Model provider for extraction (default: claude).")
+    ap.add_argument("--model", help="Override the extraction model (implies provider).")
     ap.add_argument("--detect-model", default=None,
                     help="Model for the cross-page section-continuation check (default: engine's MODEL).")
     ap.add_argument("--no-detect", action="store_true",
@@ -437,22 +481,24 @@ def main() -> None:
         print(f"Note: writing Excel output as {output_path} (not {args.output}).")
 
     engine = load_engine(args.engine)
+    provider, model = engine.resolve_provider_model(args.provider, args.model)
     if args.detect_model == "__engine__":
-        args.detect_model = getattr(engine, "MODEL", "claude-opus-4-8")
+        args.detect_model = model
+    detect_provider = engine.provider_for_model(args.detect_model)
     images = list_images(args.folder)
 
     pages_dir = args.pages_dir or tempfile.mkdtemp(prefix="menu_pages_")
     os.makedirs(pages_dir, exist_ok=True)
 
-    print(f"Found {len(images)} page(s). Running the extractor once per page:")
+    print(f"Found {len(images)} page(s). Running the extractor ({provider}: {model}) once per page:")
     page_paths = []
     usage_records = []          # one dict per API call, each {model, input_tokens, output_tokens}
     for idx, image in enumerate(images, start=1):
         page_xlsx = os.path.join(pages_dir, f"page_{idx:03d}.xlsx")
         print(f"  [{idx}/{len(images)}] {os.path.basename(image)} -> {os.path.basename(page_xlsx)}")
-        usage = run_engine_on_image(args.python, args.engine, image, page_xlsx)
+        usage = run_engine_on_image(args.python, args.engine, image, page_xlsx, provider, model)
         if usage:
-            usage.setdefault("model", getattr(engine, "MODEL", "claude-opus-4-8"))
+            usage.setdefault("model", model)
             usage_records.append(usage)
         page_paths.append(page_xlsx)
 
@@ -464,7 +510,8 @@ def main() -> None:
         print("  Section continuations across pages: name-matching (AI detection off).")
     else:
         try:
-            continuation_pages, detect_usage = continuations_by_ai(page_section_lists, args.detect_model)
+            continuation_pages, detect_usage = continuations_by_ai(
+                page_section_lists, args.detect_model, detect_provider)
             if detect_usage:
                 usage_records.append(detect_usage)
             print(f"  Section continuations across pages (AI): "
@@ -474,6 +521,7 @@ def main() -> None:
             print(f"  AI continuation check unavailable ({exc}); used name-matching instead.")
 
     merged_rows, variant_rows, section_rows = stitch(page_paths, engine.COLUMNS, continuation_pages)
+    engine.finalize_sec(merged_rows, section_rows)   # assign sec ids + write into Sec
     engine.write_excel(merged_rows, output_path, variant_rows, section_rows)
     print(f"Wrote {len(merged_rows)} items ({len(variant_rows)} size variants, "
           f"{len(section_rows)} section modifiers) from {len(page_paths)} page(s) to {output_path}")

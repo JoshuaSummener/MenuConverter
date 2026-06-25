@@ -38,7 +38,7 @@ SEC       A combinability group. A sec id marks a set of items that can be
 Engine
 ------
 Plain OCR cannot judge combinability or item type, so the analysis is done by
-Claude's vision model: the image is sent to the Anthropic Messages API, which
+Anthropic's Claude vision model: the image is sent to the Claude API, which
 returns strict JSON that is then mapped onto the spreadsheet.
 
 Usage
@@ -69,19 +69,43 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-MODEL = "claude-opus-4-8"
-MAX_TOKENS = 16000
+# Default model per provider; choose with --provider (or imply it via --model).
+PROVIDERS = {
+    "claude": {"default_model": "claude-opus-4-8", "key_env": ("ANTHROPIC_API_KEY",)},
+    "gemini": {"default_model": "gemini-2.5-pro",  "key_env": ("GEMINI_API_KEY", "GOOGLE_API_KEY")},
+}
+PROVIDER = "claude"          # resolved at runtime from CLI
+MODEL = "claude-opus-4-8"    # resolved at runtime from CLI
+MAX_TOKENS = 16000           # output budget per call; the continuation loop handles longer menus
 
 # Image extensions recognized when scanning a folder of menu pages.
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
-# USD per 1,000,000 tokens, as (input, output). Edit if rates change.
+# USD per 1,000,000 tokens, as (input, output). Approximate — edit if rates change.
 PRICES = {
-    "claude-opus-4-8":            (5.0, 25.0),
-    "claude-sonnet-4-6":          (3.0, 15.0),
-    "claude-haiku-4-5-20251001":  (1.0,  5.0),
+    "claude-opus-4-8":       (15.0, 75.0),
+    "claude-sonnet-4-6":     (3.0, 15.0),
+    "claude-haiku-4-5":      (1.0,  5.0),
+    "gemini-2.5-pro":        (1.25, 10.0),
+    "gemini-2.5-flash":      (0.30,  2.50),
+    "gemini-2.5-flash-lite": (0.10,  0.40),
 }
-DEFAULT_PRICE = (5.0, 25.0)
+DEFAULT_PRICE = (15.0, 75.0)
+
+
+def provider_for_model(model: str) -> str:
+    return "gemini" if str(model).lower().startswith("gemini") else "claude"
+
+
+def resolve_provider_model(provider, model):
+    """Fill provider/model from whichever was supplied (defaults to claude)."""
+    if model and not provider:
+        provider = provider_for_model(model)
+    if provider and not model:
+        model = PROVIDERS[provider]["default_model"]
+    if not provider and not model:
+        provider, model = "claude", PROVIDERS["claude"]["default_model"]
+    return provider, model
 
 # Running token total for this process (one API call per run here).
 USAGE = {"input_tokens": 0, "output_tokens": 0}
@@ -269,13 +293,22 @@ Return only the JSON object."""
 # Step 2 — call the vision model
 # --------------------------------------------------------------------------- #
 
-def encode_image(path: str):
+def read_image_b64(path: str):
+    """Return (base64_data, mime_type) for a Claude image block."""
     media_type, _ = mimetypes.guess_type(path)
     if media_type is None or not media_type.startswith("image/"):
         media_type = "image/jpeg"
     with open(path, "rb") as fh:
-        data = base64.standard_b64encode(fh.read()).decode("utf-8")
-    return data, media_type
+        return base64.b64encode(fh.read()).decode("ascii"), media_type
+
+
+def read_image_bytes(path: str):
+    """Return (raw_bytes, mime_type) for a Gemini inline image part."""
+    media_type, _ = mimetypes.guess_type(path)
+    if media_type is None or not media_type.startswith("image/"):
+        media_type = "image/jpeg"
+    with open(path, "rb") as fh:
+        return fh.read(), media_type
 
 
 def natural_key(path: str):
@@ -299,69 +332,153 @@ def list_images(folder: str) -> list:
     return sorted(paths, key=natural_key)
 
 
-def extract_with_claude(image_paths: list) -> dict:
+CONTINUE_INSTRUCTION = (
+    "Your previous reply was cut off because it was too long. Continue the "
+    "JSON from EXACTLY where it stopped — your next characters must directly "
+    "follow the last characters of your previous reply. Do not repeat anything "
+    "you already wrote, do not restart, and do not add any explanation or "
+    "markdown fences. Output only the remaining JSON."
+)
+
+
+def extract_menu(image_paths: list, provider: str, model: str) -> dict:
+    """Dispatch a single menu (one or more page images) to the chosen provider."""
+    if provider == "gemini":
+        return extract_with_gemini(image_paths, model)
+    return extract_with_claude(image_paths, model)
+
+
+def extract_with_claude(image_paths: list, model: str) -> dict:
     """Send one or more page images (in order) as a single menu to Claude."""
     try:
-        from anthropic import Anthropic
+        import anthropic
     except ImportError:
         sys.exit("The 'anthropic' package is required. Run: pip install anthropic")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
         sys.exit("Set ANTHROPIC_API_KEY in your environment before running.")
+    client = anthropic.Anthropic(api_key=api_key)
 
-    content = []
+    # Build the user turn: page images (in order) followed by the prompt.
+    blocks = []
     for i, path in enumerate(image_paths, start=1):
-        data, media_type = encode_image(path)
+        b64, media_type = read_image_b64(path)
         if len(image_paths) > 1:
-            content.append({"type": "text", "text": f"--- Page {i} ---"})
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": media_type, "data": data},
-        })
-    content.append({"type": "text", "text": build_prompt(len(image_paths))})
-    user_msg = {"role": "user", "content": content}
+            blocks.append({"type": "text", "text": f"--- Page {i} ---"})
+        blocks.append({"type": "image",
+                       "source": {"type": "base64", "media_type": media_type, "data": b64}})
+    blocks.append({"type": "text", "text": build_prompt(len(image_paths))})
+    user_turn = {"role": "user", "content": blocks}
 
-    continue_instruction = (
-        "Your previous reply was cut off because it was too long. Continue the "
-        "JSON from EXACTLY where it stopped — your next characters must directly "
-        "follow the last characters of your previous reply. Do not repeat anything "
-        "you already wrote, do not restart, and do not add any explanation or "
-        "markdown fences. Output only the remaining JSON."
-    )
-
-    client = Anthropic()
     accumulated = ""
     for round_no in range(12):                 # safety cap on continuations
         if not accumulated:
-            messages = [user_msg]
+            messages = [user_turn]
         else:
-            # keep the partial reply as context, then end with a USER message
-            # (this model does not allow ending on an assistant message).
+            # keep the partial reply as an assistant turn, then a user "continue" turn
             messages = [
-                user_msg,
+                user_turn,
                 {"role": "assistant", "content": accumulated},
-                {"role": "user", "content": continue_instruction},
+                {"role": "user", "content": CONTINUE_INSTRUCTION},
             ]
-        message = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            messages=messages,
+        response = client.messages.create(
+            model=model, max_tokens=MAX_TOKENS, messages=messages,
         )
-        usage = getattr(message, "usage", None)
-        if usage is not None:
-            USAGE["input_tokens"] += getattr(usage, "input_tokens", 0) or 0
-            USAGE["output_tokens"] += getattr(usage, "output_tokens", 0) or 0
-        chunk = "".join(b.text for b in message.content if b.type == "text")
-        # JSON ignores inter-token whitespace; trailing whitespace would also make
-        # an invalid assistant turn, so trim it before the next round.
+        u = getattr(response, "usage", None)
+        if u is not None:
+            USAGE["input_tokens"] += getattr(u, "input_tokens", 0) or 0
+            USAGE["output_tokens"] += getattr(u, "output_tokens", 0) or 0
+        chunk = _claude_text(response)
         accumulated = _stitch_text(accumulated, chunk).rstrip()
-        if message.stop_reason != "max_tokens":
+        if getattr(response, "stop_reason", None) != "max_tokens":
             break
         if round_no >= 1:
             print(f"  (page is long — continuing extraction, part {round_no + 2})")
     else:
         sys.exit("Page was too long to finish even after many continuation rounds.")
-
     return parse_json(accumulated)
+
+
+def _claude_text(response) -> str:
+    """Concatenate the text blocks of a Claude response."""
+    return "".join(getattr(b, "text", "") or ""
+                   for b in (getattr(response, "content", None) or [])
+                   if getattr(b, "type", None) == "text")
+
+
+def extract_with_gemini(image_paths: list, model: str) -> dict:
+    """Send one or more page images (in order) as a single menu to Gemini."""
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        sys.exit("The 'google-genai' package is required. Run: pip install google-genai")
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        sys.exit("Set GEMINI_API_KEY in your environment before running.")
+    client = genai.Client(api_key=api_key)
+
+    parts = []
+    for i, path in enumerate(image_paths, start=1):
+        raw, media_type = read_image_bytes(path)
+        if len(image_paths) > 1:
+            parts.append(types.Part.from_text(text=f"--- Page {i} ---"))
+        parts.append(types.Part.from_bytes(data=raw, mime_type=media_type))
+    parts.append(types.Part.from_text(text=build_prompt(len(image_paths))))
+    user_turn = types.Content(role="user", parts=parts)
+    config = types.GenerateContentConfig(max_output_tokens=MAX_TOKENS, temperature=0)
+
+    accumulated = ""
+    for round_no in range(12):
+        if not accumulated:
+            contents = [user_turn]
+        else:
+            contents = [
+                user_turn,
+                types.Content(role="model", parts=[types.Part.from_text(text=accumulated)]),
+                types.Content(role="user", parts=[types.Part.from_text(text=CONTINUE_INSTRUCTION)]),
+            ]
+        response = client.models.generate_content(model=model, contents=contents, config=config)
+        um = getattr(response, "usage_metadata", None)
+        if um is not None:
+            USAGE["input_tokens"] += getattr(um, "prompt_token_count", 0) or 0
+            USAGE["output_tokens"] += ((getattr(um, "candidates_token_count", 0) or 0)
+                                       + (getattr(um, "thoughts_token_count", 0) or 0))
+        chunk = _gemini_text(response)
+        accumulated = _stitch_text(accumulated, chunk).rstrip()
+        if not _gemini_truncated(response):
+            break
+        if round_no >= 1:
+            print(f"  (page is long — continuing extraction, part {round_no + 2})")
+    else:
+        sys.exit("Page was too long to finish even after many continuation rounds.")
+    return parse_json(accumulated)
+
+
+def _gemini_text(response) -> str:
+    """Concatenate all text parts of a Gemini response, robust to empty/blocked parts."""
+    try:
+        if response.text:
+            return response.text
+    except Exception:
+        pass
+    out = []
+    for cand in (getattr(response, "candidates", None) or []):
+        content = getattr(cand, "content", None)
+        for part in (getattr(content, "parts", None) or []):
+            t = getattr(part, "text", None)
+            if t:
+                out.append(t)
+    return "".join(out)
+
+
+def _gemini_truncated(response) -> bool:
+    """True if the Gemini response was cut off at the output-token limit."""
+    cands = getattr(response, "candidates", None) or []
+    if not cands:
+        return False
+    fr = getattr(cands[0], "finish_reason", None)
+    return fr is not None and str(fr).upper().endswith("MAX_TOKENS")
 
 
 def _stitch_text(accumulated: str, chunk: str) -> str:
@@ -424,10 +541,75 @@ def _sec_string(sec):
     return ",".join(str(i) for i in ids) if ids else None
 
 
+def _parse_sec_ids(value):
+    """'1,2' -> [1, 2]; handles ints, floats, blanks, None."""
+    if value is None:
+        return []
+    if isinstance(value, (int, float)):
+        return [int(value)]
+    ids = []
+    for tok in str(value).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            ids.append(int(float(tok)))
+        except ValueError:
+            pass
+    return ids
+
+
+def finalize_sec(menu_rows, section_rows):
+    """Turn the per-group Section Ids into real sec ids and write them into the
+    Menu 'Sec' column.
+
+    Section Ids are sec ids in the SAME space as combo ids, so to avoid clashes
+    they are shifted to sit just past the highest combo id already present in
+    Sec. Then every item gets the sec id(s) of the modifier group(s) belonging to
+    its section (matched by section name, not by category id). Existing combo ids
+    are kept; ids are merged, de-duplicated, and sorted.
+    """
+    if not section_rows:
+        return
+    combo_max = 0
+    for row in menu_rows:
+        for i in _parse_sec_ids(row.get("Sec")):
+            combo_max = max(combo_max, i)
+
+    # shift group ordinals to sit just after the combo ids, preserving order
+    old_ids = sorted({r.get("Section Id") for r in section_rows
+                      if r.get("Section Id") is not None})
+    remap = {old: combo_max + rank for rank, old in enumerate(old_ids, start=1)}
+    for r in section_rows:
+        if r.get("Section Id") in remap:
+            r["Section Id"] = remap[r["Section Id"]]
+
+    # section name -> the sec ids of its groups
+    name_to_sec = {}
+    for r in section_rows:
+        nm = (r.get("SectionName") or "").strip().lower()
+        if r.get("Section Id") is not None:
+            name_to_sec.setdefault(nm, set()).add(r.get("Section Id"))
+
+    # write those sec ids into each item's Sec, by forward-filled section name
+    current_name = None
+    for row in menu_rows:
+        if row.get("Category") is not None:
+            current_name = (row.get("Category") or "").strip().lower()
+        sec_ids = name_to_sec.get(current_name)
+        if sec_ids:
+            ids = _parse_sec_ids(row.get("Sec"))
+            for s in sec_ids:
+                if s not in ids:
+                    ids.append(s)
+            row["Sec"] = _sec_string(sorted(ids))
+
+
 def build_rows(menu: dict):
     """Return (menu_rows, variant_rows, section_rows).
     variant_rows link to menu rows by Item id; section_rows hold per-section
-    modifier options (Section Id == the section's Category ID)."""
+    modifier options. Section Id is a provisional per-section ordinal; finalize_sec
+    later turns it into a real sec id (in the combo id space) and writes it to Sec."""
     rows = []
     variant_rows = []
     section_rows = []
@@ -437,11 +619,13 @@ def build_rows(menu: dict):
     item_id = 0
     variant_id = 0
     modifier_id = 0
+    group_ordinal = 0          # one sec id per SECTION that has modifiers (a sec id, NOT the category id)
     first_row = True
 
     for section in menu.get("sections", []):
         category_id += 1
         sec_tr = _as_list(section.get("name_translations"))
+        has_mods = bool(section.get("modifier_groups"))
         first_item = True
         for item in section.get("items", []):
             item_id += 1
@@ -476,13 +660,18 @@ def build_rows(menu: dict):
             first_item = False
 
         # section-level modifier groups (rice/noodle choice, protein add-ons, ...)
-        for group in (section.get("modifier_groups") or []):
+        # The whole section shares ONE sec id (a sec id, NOT the category id);
+        # different groups within it are distinguished by their Min/Max.
+        groups = section.get("modifier_groups") or []
+        if groups:
+            group_ordinal += 1
+        for group in groups:
             gmin = int(group.get("min", 0) or 0)
             gmax = int(group.get("max", 1) or 1)
             for opt in (group.get("options") or []):
                 modifier_id += 1
                 section_rows.append({
-                    "Section Id":    category_id,
+                    "Section Id":    group_ordinal,
                     "SectionName":   section.get("name"),
                     "Min":           gmin,
                     "Max":           gmax,
@@ -604,7 +793,16 @@ def main() -> None:
     src.add_argument("--from-json", help="Previously extracted JSON (skips the API).")
     ap.add_argument("--output", required=True, help="Path for the .xlsx file to write.")
     ap.add_argument("--save-json", help="Optionally save the raw extracted JSON here.")
+    ap.add_argument("--provider", choices=["claude", "gemini"],
+                    help="Which model provider to use for extraction (default: claude).")
+    ap.add_argument("--model", help="Override the model name (implies the provider).")
+    ap.add_argument("--no-section-sec", action="store_true",
+                    help="Do not write section ids into the Menu 'Sec' column "
+                         "(used by the folder orchestrator, which applies them after stitching).")
     args = ap.parse_args()
+
+    global PROVIDER, MODEL
+    PROVIDER, MODEL = resolve_provider_model(args.provider, args.model)
 
     output_path = args.output
     if not output_path.lower().endswith(".xlsx"):
@@ -617,18 +815,20 @@ def main() -> None:
             menu = json.load(fh)
     elif args.folder:
         images = list_images(args.folder)
-        print(f"Scanning {len(images)} page(s) as one menu:")
+        print(f"Scanning {len(images)} page(s) as one menu with {PROVIDER} ({MODEL}):")
         for p in images:
             print(f"  - {os.path.basename(p)}")
-        menu = extract_with_claude(images)
+        menu = extract_menu(images, PROVIDER, MODEL)
     else:
-        menu = extract_with_claude([args.image])
+        menu = extract_menu([args.image], PROVIDER, MODEL)
 
     if args.save_json:
         with open(args.save_json, "w", encoding="utf-8") as fh:
             json.dump(menu, fh, ensure_ascii=False, indent=2)
 
     rows, variant_rows, section_rows = build_rows(menu)
+    if not args.no_section_sec:
+        finalize_sec(rows, section_rows)
     write_excel(rows, output_path, variant_rows, section_rows)
     print(f"Wrote {len(rows)} items ({len(variant_rows)} size variants, "
           f"{len(section_rows)} section modifiers) to {output_path}")

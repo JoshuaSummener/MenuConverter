@@ -41,6 +41,28 @@ TEMPLATE = os.path.join(BASE_DIR, "pos_template.xlsx")   # optional base for POS
 JOBS = os.path.join(BASE_DIR, "jobs")
 os.makedirs(JOBS, exist_ok=True)
 
+
+def _load_local_keys():
+    """Load API keys from a gitignored 'secrets.env' next to app.py, if present.
+    File format (one per line):  ANTHROPIC_API_KEY=sk-ant-...   /   GEMINI_API_KEY=AIza...
+    Existing environment variables win, so `export ...` still overrides the file.
+    Keeping the key here (and in .gitignore) means it is NOT baked into tracked code."""
+    path = os.path.join(BASE_DIR, "secrets.env")
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            name, value = name.strip(), value.strip().strip('"').strip("'")
+            if name and value and not os.environ.get(name):
+                os.environ[name] = value
+
+
+_load_local_keys()
+
 ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 app = Flask(__name__)
@@ -64,10 +86,11 @@ def run(cmd, env=None):
     return p.stdout
 
 
-def extract_to_combined(img_dir, combined_path):
-    """photos -> our combined workbook (runs the Claude-vision orchestrator)."""
+def extract_to_combined(img_dir, combined_path, provider="claude"):
+    """photos -> our combined workbook (runs the vision orchestrator)."""
     run([sys.executable, ORCH, "--folder", img_dir,
-         "--output", combined_path, "--engine", ENGINE], env=os.environ.copy())
+         "--output", combined_path, "--engine", ENGINE, "--provider", provider],
+        env=os.environ.copy())
 
 
 def build_outputs(combined_path, job_dir, menu_name):
@@ -140,17 +163,30 @@ PAGE = """
     <label>Menu name <span style="font-weight:400;color:#6b7280">(optional)</span></label>
     <input type=text name=menu_name placeholder="e.g. China Taste">
 
-    {% if not has_key %}
-    <label>Anthropic API key</label>
-    <input type=password name=api_key placeholder="AIza...">
-    <div class="key bad">No ANTHROPIC_API_KEY found in the environment — paste one above.</div>
-    {% else %}
-    <div class="key ok" style="margin-top:14px">✓ API key detected in environment.</div>
-    {% endif %}
+    <label>Model provider</label>
+    <select name=provider id=provider onchange="keyHint()">
+      <option value=claude>Claude (Anthropic)</option>
+      <option value=gemini>Gemini (Google)</option>
+    </select>
+
+    <label>API key <span style="font-weight:400;color:#6b7280">(for the selected provider)</span></label>
+    <input type=password name=api_key id=apikey placeholder="sk-ant-...">
+    <div class=key id=keystatus>
+      <span class="{{ 'ok' if has_claude else 'bad' }}">{{ '✓' if has_claude else '✗' }} Anthropic key {{ 'detected' if has_claude else 'not set' }}</span>
+      &nbsp;·&nbsp;
+      <span class="{{ 'ok' if has_gemini else 'bad' }}">{{ '✓' if has_gemini else '✗' }} Gemini key {{ 'detected' if has_gemini else 'not set' }}</span>
+    </div>
 
     <button type=submit>Convert menu</button>
   </form>
-  <div class=hint>Extraction uses Claude vision and runs one page at a time, so a multi-page menu can take a minute or two.</div>
+  <div class=hint id=hint>Extraction runs one page at a time, so a multi-page menu can take a minute or two.</div>
+  <script>
+    function keyHint(){
+      var p=document.getElementById('provider').value;
+      document.getElementById('apikey').placeholder = (p=='gemini') ? 'AIza...' : 'sk-ant-...';
+    }
+    keyHint();
+  </script>
 </div></div>
 <div id=overlay><div class=spin></div><div><b>Reading your menu…</b><br>This can take a minute or two per page.</div></div>
 </body></html>
@@ -187,24 +223,37 @@ RESULT = """
 """
 
 
+def _key_ctx():
+    return {
+        "has_claude": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "has_gemini": bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")),
+    }
+
+
 @app.route("/")
 def index():
-    return render_template_string(PAGE, has_key=bool((os.environ.get("ANTHROPIC_API_KEY"))))
+    return render_template_string(PAGE, **_key_ctx())
 
 
 @app.route("/process", methods=["POST"])
 def process():
-    has_key = bool((os.environ.get("ANTHROPIC_API_KEY")))
     files = [f for f in request.files.getlist("images") if f and f.filename]
     if not files:
-        return render_template_string(PAGE, has_key=has_key, error="Please choose at least one menu image.")
+        return render_template_string(PAGE, error="Please choose at least one menu image.", **_key_ctx())
+
+    provider = request.form.get("provider", "claude").strip().lower()
+    if provider not in ("claude", "gemini"):
+        provider = "claude"
+    key_var = "GEMINI_API_KEY" if provider == "gemini" else "ANTHROPIC_API_KEY"
+    other_var = "GOOGLE_API_KEY" if provider == "gemini" else None
 
     api_key = request.form.get("api_key", "").strip()
     if api_key:
-        os.environ["ANTHROPIC_API_KEY"] = api_key
-    if not (os.environ.get("ANTHROPIC_API_KEY")):
-        return render_template_string(PAGE, has_key=False,
-                                      error="An Anthropic API key is required to read the menu.")
+        os.environ[key_var] = api_key
+    have = os.environ.get(key_var) or (os.environ.get(other_var) if other_var else None)
+    if not have:
+        nice = "Gemini" if provider == "gemini" else "Anthropic"
+        return render_template_string(PAGE, error=f"A {nice} API key is required to read the menu.", **_key_ctx())
 
     menu_name = request.form.get("menu_name", "").strip() or None
 
@@ -220,16 +269,14 @@ def process():
             f.save(os.path.join(img_dir, safe_name(f.filename)))
             saved += 1
     if saved == 0:
-        return render_template_string(PAGE, has_key=has_key,
-                                      error="No supported image files were uploaded (PNG/JPG/WEBP).")
+        return render_template_string(PAGE, error="No supported image files were uploaded (PNG/JPG/WEBP).", **_key_ctx())
 
     combined = os.path.join(job_dir, "menu_combined.xlsx")
     try:
-        extract_to_combined(img_dir, combined)
+        extract_to_combined(img_dir, combined, provider)
         build_outputs(combined, job_dir, menu_name)
     except Exception as exc:
-        return render_template_string(PAGE, has_key=has_key,
-                                      error="Something went wrong while processing:\n\n" + str(exc))
+        return render_template_string(PAGE, error="Something went wrong while processing:\n\n" + str(exc), **_key_ctx())
     return render_template_string(RESULT, job=job)
 
 
@@ -257,4 +304,4 @@ def download(job, which):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8002, debug=False)
+    app.run(host="127.0.0.1", port=5000, debug=False)
