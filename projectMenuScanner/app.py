@@ -41,11 +41,16 @@ TEMPLATE = os.path.join(BASE_DIR, "pos_template.xlsx")   # optional base for POS
 JOBS = os.path.join(BASE_DIR, "jobs")
 os.makedirs(JOBS, exist_ok=True)
 
+# Substrings that mark an un-edited example value (never treat these as a real key).
+PLACEHOLDER_MARKERS = ("your-key-here", "your_key_here", "replace", "example", "changeme")
+
 
 def _load_local_keys():
     """Load API keys from a gitignored 'secrets.env' next to app.py, if present.
     File format (one per line):  ANTHROPIC_API_KEY=sk-ant-...   /   GEMINI_API_KEY=AIza...
     Existing environment variables win, so `export ...` still overrides the file.
+    Obvious leftover placeholders (e.g. 'sk-ant-your-key-here') are ignored, so an
+    un-edited example line never masquerades as a real key.
     Keeping the key here (and in .gitignore) means it is NOT baked into tracked code."""
     path = os.path.join(BASE_DIR, "secrets.env")
     if not os.path.exists(path):
@@ -57,7 +62,11 @@ def _load_local_keys():
                 continue
             name, _, value = line.partition("=")
             name, value = name.strip(), value.strip().strip('"').strip("'")
-            if name and value and not os.environ.get(name):
+            if not name or not value:
+                continue
+            if any(m in value.lower() for m in PLACEHOLDER_MARKERS):
+                continue                       # skip un-edited placeholder lines
+            if not os.environ.get(name):
                 os.environ[name] = value
 
 
@@ -223,10 +232,49 @@ RESULT = """
 """
 
 
+def looks_like_key(provider, value):
+    """Cheap offline sanity check: present, not a placeholder, right shape."""
+    if not value:
+        return False
+    v = value.strip()
+    if any(m in v.lower() for m in PLACEHOLDER_MARKERS):
+        return False
+    if provider == "claude":
+        return v.startswith("sk-ant-") and len(v) >= 40
+    return len(v) >= 20            # Gemini keys vary in prefix/length
+
+
+def verify_key_live(provider, key):
+    """Auth-only check against the provider.
+    Returns ('valid' | 'invalid' | 'unknown', detail).
+    'unknown' (no network, SDK missing, etc.) does NOT block — the real run will surface it."""
+    try:
+        if provider == "claude":
+            import anthropic
+            try:
+                anthropic.Anthropic(api_key=key).models.list()
+                return "valid", ""
+            except anthropic.AuthenticationError as exc:
+                return "invalid", str(exc)[:200]
+        else:
+            from google import genai
+            try:
+                next(iter(genai.Client(api_key=key).models.list()), None)
+                return "valid", ""
+            except Exception as exc:
+                if any(s in str(exc).lower() for s in
+                       ("api key not valid", "api_key_invalid", "permission",
+                        "unauthenticated", "invalid argument", "401", "403")):
+                    return "invalid", str(exc)[:200]
+                raise
+    except Exception as exc:
+        return "unknown", str(exc)[:200]
+
+
 def _key_ctx():
     return {
-        "has_claude": bool(os.environ.get("ANTHROPIC_API_KEY")),
-        "has_gemini": bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")),
+        "has_claude": looks_like_key("claude", os.environ.get("ANTHROPIC_API_KEY")),
+        "has_gemini": looks_like_key("gemini", os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")),
     }
 
 
@@ -251,9 +299,19 @@ def process():
     if api_key:
         os.environ[key_var] = api_key
     have = os.environ.get(key_var) or (os.environ.get(other_var) if other_var else None)
-    if not have:
-        nice = "Gemini" if provider == "gemini" else "Anthropic"
-        return render_template_string(PAGE, error=f"A {nice} API key is required to read the menu.", **_key_ctx())
+    nice = "Gemini" if provider == "gemini" else "Anthropic"
+
+    if not looks_like_key(provider, have):
+        hint = " It should start with 'sk-ant-'." if provider == "claude" else ""
+        return render_template_string(
+            PAGE, error=f"The {nice} API key is missing or doesn't look valid.{hint} "
+                        f"Check your secrets.env, or paste a key above.", **_key_ctx())
+
+    status, detail = verify_key_live(provider, have)
+    if status == "invalid":
+        return render_template_string(
+            PAGE, error=f"The {nice} API key was rejected by the provider:\n\n{detail}\n\n"
+                        f"Double-check the key (and that it's for the right provider).", **_key_ctx())
 
     menu_name = request.form.get("menu_name", "").strip() or None
 
